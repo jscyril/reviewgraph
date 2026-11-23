@@ -29,6 +29,8 @@ def main() -> None:
     p.add_argument("--model", help="Override the provider's default model")
     p.add_argument("--post", action="store_true", help="Post the review to the PR (asks for approval first)")
     p.add_argument("--yes", action="store_true", help="With --post: skip the approval prompt (for CI)")
+    p.add_argument("--min-severity", choices=["low", "medium", "high"], default="medium",
+                   help="Hide findings below this severity (default: medium)")
     p.add_argument("--repo-dir", default=".", help="For local diffs: repo root reviewers may read files from")
     p.add_argument("--max-concurrency", type=int, default=8, help="Max reviewers running at once")
     args = p.parse_args()
@@ -40,6 +42,7 @@ def main() -> None:
         state = {"diff": target.read_text(), "local_dir": args.repo_dir}
     else:
         state = {"pr_url": args.target, "post": args.post, "auto_approve": args.yes}
+    state["min_severity"] = args.min_severity
 
     llm, method = make_llm(args.provider, args.model)
     graph = build_graph(llm, method, checkpointer=InMemorySaver())

@@ -1,0 +1,47 @@
+diff --git a/app/orders.py b/app/orders.py
+new file mode 100644
+index 0000000..6921656
+--- /dev/null
++++ b/app/orders.py
+@@ -0,0 +1,13 @@
++from app.db import query
++
++
++def orders_for(customer_id: str) -> list[tuple]:
++    return query("SELECT id, total FROM orders WHERE customer = %s", customer_id)
++
++
++def order_summaries(customer_ids: list[str]) -> dict[str, float]:
++    totals = {}
++    for cid in customer_ids:
++        rows = query("SELECT total FROM orders WHERE customer = %s", cid)
++        totals[cid] = sum(r[0] for r in rows)
++    return totals
+diff --git a/app/download.py b/app/download.py
+new file mode 100644
+index 0000000..c086d93
+--- /dev/null
++++ b/app/download.py
+@@ -0,0 +1,22 @@
++import hashlib
++import hmac
++import os
++
++from flask import Flask, abort, request, send_file
++
++app = Flask(__name__)
++UPLOAD_DIR = "/srv/uploads"
++
++
++@app.get("/download")
++def download():
++    name = request.args["name"]
++    return send_file(os.path.join(UPLOAD_DIR, name))
++
++
++@app.post("/webhook")
++def webhook():
++    expected = hmac.new(os.environ["WEBHOOK_SECRET"].encode(), request.data, hashlib.sha256).hexdigest()
++    if expected != request.headers.get("X-Signature", ""):
++        abort(401)
++    return {"ok": True}

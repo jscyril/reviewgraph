@@ -17,6 +17,9 @@ inputs:
   github-token:
     description: Token used to read the PR and post the review (needs pull-requests write).
     default: ${{ github.token }}
+  min-severity:
+    description: "Hide findings below this severity: low, medium, or high."
+    default: medium
   max-concurrency:
     description: Max reviewers running at once (lower it if you hit provider rate limits).
     default: "8"
@@ -33,8 +36,9 @@ runs:
         PROVIDER: ${{ inputs.provider }}
         MODEL: ${{ inputs.model }}
         MAX_CONCURRENCY: ${{ inputs.max-concurrency }}
+        MIN_SEVERITY: ${{ inputs.min-severity }}
       run: |
         if [ -z "$PR_URL" ]; then echo "::error::No PR to review: run on pull_request or set pr-url"; exit 1; fi
         uv run --quiet --frozen --project "$GITHUB_ACTION_PATH" pr-reviewer "$PR_URL" \
           --provider "$PROVIDER" ${MODEL:+--model "$MODEL"} \
-          --max-concurrency "$MAX_CONCURRENCY" --post --yes | tee -a "$GITHUB_STEP_SUMMARY"
+          --max-concurrency "$MAX_CONCURRENCY" --min-severity "$MIN_SEVERITY" --post --yes | tee -a "$GITHUB_STEP_SUMMARY"

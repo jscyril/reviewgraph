@@ -4,6 +4,11 @@ A bug's location is given by a `needle` (a substring of the buggy line) rather t
 line number, so editing a snippet can't silently break the expected line.
 """
 
+import difflib
+from pathlib import Path
+
+from evals.hard_cases import HARD_CASES
+
 CASES = [
     {
         "id": "sql-injection", "path": "app/users.py", "category": "security", "needle": 'cur.execute(f"',
@@ -161,6 +166,9 @@ class Money:
 ]
 
 
+CASES += HARD_CASES
+
+
 def bug_line(case: dict) -> int | None:
     if not case["needle"]:
         return None
@@ -170,8 +178,19 @@ def bug_line(case: dict) -> int | None:
 
 
 def as_diff(case: dict) -> str:
-    """Render the case as a git diff that adds the whole file."""
-    lines = case["code"].splitlines()
+    """Render the case as a git diff: a modification if it has `before`, otherwise a new file."""
     path = case["path"]
+    if "before" in case:
+        body = "".join(difflib.unified_diff(case["before"].splitlines(keepends=True), case["code"].splitlines(keepends=True),
+                                            fromfile=f"a/{path}", tofile=f"b/{path}"))
+        return f"diff --git a/{path} b/{path}\n{body}"
+    lines = case["code"].splitlines()
     body = "".join(f"+{line}\n" for line in lines)
     return f"diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n{body}"
+
+
+def write_repo(case: dict, root: Path) -> None:
+    """Materialize the case's repo (changed file + context files) so reviewers can read_file it."""
+    for rel, text in {case["path"]: case["code"], **case.get("context", {})}.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text)

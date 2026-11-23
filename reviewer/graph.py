@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Annotated, Literal, TypedDict
 
 import httpx
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import tool
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send, interrupt
 from pydantic import BaseModel, Field
@@ -33,7 +35,9 @@ SEVERITY_GUIDE = ("Severity: high = exploitable vulnerability, data loss, or a c
                   "medium = a likely bug or a significant, measurable slowdown; low = maintainability or readability. "
                   "Missing tests, docs, or type hints are never above low.")
 MAX_TOOL_STEPS = 4  # read_file rounds per reviewer before it must answer
-RETRY = {"stop_after_attempt": 4, "wait_exponential_jitter": True}  # rides out 429s and 5xx "high demand" blips
+# Waits 2s, 4s, 8s, 16s (+jitter, capped at 30s): long enough to outlast per-minute rate limits (429) and
+# 5xx "high demand" blips, which short retries didn't on Groq's free tier.
+RETRY = {"stop_after_attempt": 5, "wait_exponential_jitter": True, "exponential_jitter_params": {"initial": 2, "max": 30}}
 MAX_FILE_CHARS = 60_000
 FULL_DIFF_FOR_SUPERVISOR = 100_000  # above this the supervisor sees only the file list
 LOCKFILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "uv.lock", "poetry.lock", "Pipfile.lock",
@@ -65,6 +69,7 @@ class State(TypedDict, total=False):
     local_dir: str  # for local diffs: repo root that read_file may read from
     post: bool
     auto_approve: bool
+    min_severity: str  # "low" (default: show all), "medium", or "high"
     # derived
     owner: str
     repo: str
@@ -130,29 +135,46 @@ def read_source(source: dict, path: str) -> str:
     return text
 
 
+MERGE_WITHIN_LINES = 1  # reviewers often flag the same problem one line apart (the def vs. the bad call)
+
+
 def dedupe(findings: list[Finding]) -> list[Finding]:
-    """Merge findings on the same file+line (e.g. security and style both flag it) into one."""
-    groups: dict[tuple, list[Finding]] = {}
-    for i, f in enumerate(findings):
-        groups.setdefault((f.file, f.line) if f.line else (f.file, None, i), []).append(f)
+    """Merge findings in the same file within MERGE_WITHIN_LINES of a group's first line (e.g. security and
+    style both flag the same call) into one. Line-less findings are never merged."""
+    groups: list[list[Finding]] = []
+    for f in sorted(findings, key=lambda f: (f.file, f.line or 0)):
+        g = groups[-1] if groups else None
+        if f.line and g and g[0].file == f.file and g[0].line and f.line - g[0].line <= MERGE_WITHIN_LINES:
+            g.append(f)
+        else:
+            groups.append([f])
     merged = []
-    for group in groups.values():
+    for group in groups:
         if len(group) == 1:
             merged.append(group[0])
             continue
+        group = sorted(group, key=lambda f: SEVERITY_ORDER[f.severity])  # worst first: the card leads with why it's rated so
         uniq = lambda xs: list(dict.fromkeys(xs))
+        bullets = lambda attr: "\n".join(uniq(f"- **{f.category}:** {getattr(f, attr)}" for f in group))
         merged.append(Finding(
-            file=group[0].file, line=group[0].line,
-            severity=min((f.severity for f in group), key=SEVERITY_ORDER.get),
-            issue=" Also: ".join(uniq(f.issue for f in group)),
-            suggestion=" Also: ".join(uniq(f.suggestion for f in group)),
+            file=group[0].file, line=group[0].line, severity=group[0].severity,
+            issue=bullets("issue"), suggestion="\n" + bullets("suggestion"),
             category=", ".join(uniq(f.category for f in group)),
         ))
     return sorted(merged, key=lambda f: (SEVERITY_ORDER[f.severity], f.file, f.line or 0))
 
 
+def _inline(text: str) -> str:
+    """Merged findings carry one bullet per specialist; nest them under a list item instead of running them on."""
+    text = text.strip()
+    return text if "\n" not in text else "\n" + "\n".join("     " + ln for ln in text.splitlines())
+
+
 def render_report(state: State) -> State:
-    final = dedupe(state.get("findings", []))
+    merged = dedupe(state.get("findings", []))
+    floor = state.get("min_severity", "low")
+    final = [f for f in merged if SEVERITY_ORDER[f.severity] <= SEVERITY_ORDER[floor]]
+    hidden = len(merged) - len(final)
     plan = state.get("plan")
     lines = ["# PR Review", ""]
     if plan:
@@ -169,7 +191,9 @@ def render_report(state: State) -> State:
         lines.append("No issues found.")
     for i, f in enumerate(final, 1):
         loc = f"{f.file}:{f.line}" if f.line else f.file
-        lines += [f"{i}. **[{f.severity.upper()}] [{f.category}]** `{loc}` — {f.issue}", f"   - Fix: {f.suggestion}"]
+        lines += [f"{i}. **[{f.severity.upper()}] [{f.category}]** `{loc}` — {_inline(f.issue)}", f"   - Fix: {_inline(f.suggestion)}"]
+    if hidden:
+        lines += ["", f"_{hidden} finding(s) below {floor} severity hidden._"]
     return {"final": final, "report": "\n".join(lines)}
 
 
@@ -199,7 +223,8 @@ def post(state: State) -> State:
         body.append("No issues found.")
     if general:
         body.append("### Findings outside the diff\n" + "\n".join(
-            f"- `{f.file}{':' + str(f.line) if f.line else ''}` " + comment_body(f).replace("\n\n", " ") for f in general))
+            f"- `{f.file}{':' + str(f.line) if f.line else ''}` **[{f.severity.upper()}] [{f.category}]** {_inline(f.issue)}\n"
+            f"   - Fix: {_inline(f.suggestion)}" for f in general))
     comments = [{"path": f.file, "line": f.line, "side": "RIGHT", "body": comment_body(f)} for f in inline]
     url = github.post_review(state["owner"], state["repo"], state["number"], state["head_sha"], "\n\n".join(body), comments)
     return {"review_url": url}
@@ -209,11 +234,12 @@ def post(state: State) -> State:
 
 # provider -> (default model, structured-output method)
 # anthropic: "function_calling" forces tool_choice, which Opus 5.5 rejects, so it uses native json_schema.
-# groq/openrouter: json_schema support varies by hosted model; tool calling works across nearly all of them.
+# groq: tool calling is reliable. openrouter: measured on gpt-oss-120b, tool calling came back empty in ~half
+# of calls (some hosts ignore tool_choice); json_schema never did, and its occasional 5xx are retried.
 PROVIDERS = {
     "gemini": ("gemini-flash-latest", "json_schema"),  # GEMINI_API_KEY or GOOGLE_API_KEY; pro models have no free tier
     "groq": ("openai/gpt-oss-120b", "function_calling"),  # GROQ_API_KEY
-    "openrouter": ("openai/gpt-oss-120b", "function_calling"),  # OPENROUTER_API_KEY
+    "openrouter": ("openai/gpt-oss-120b", "json_schema"),  # OPENROUTER_API_KEY
     "anthropic": ("claude-opus-5-5", "json_schema"),  # ANTHROPIC_API_KEY
 }
 
@@ -244,12 +270,25 @@ def make_llm(provider: str, model: str | None = None):
 
 # ---------- graph ----------
 
+class NoStructuredOutput(ValueError):
+    pass
+
+
+def _require_output(result):
+    if result is None:
+        raise NoStructuredOutput("model returned no structured output")
+    return result
+
+
 def build_graph(llm=None, method: str = "json_schema", checkpointer=None):
     """checkpointer is required for the human approval step (state must survive the interrupt)."""
     if llm is None:
         llm, method = make_llm("gemini")
-    planner = llm.with_structured_output(Plan, method=method).with_retry(**RETRY)
-    reviewer = llm.with_structured_output(Review, method=method).with_retry(**RETRY)
+    # With tool-calling structured output, a model that answers in prose yields None instead of raising;
+    # turn that into an error so it is retried (and, if it persists, handled like any other failure).
+    require = RunnableLambda(_require_output)
+    planner = (llm.with_structured_output(Plan, method=method) | require).with_retry(**RETRY)
+    reviewer = (llm.with_structured_output(Review, method=method) | require).with_retry(**RETRY)
 
     def supervisor(state: State) -> State:
         files = state["files"]
@@ -280,12 +319,20 @@ def build_graph(llm=None, method: str = "json_schema", checkpointer=None):
         return tasks or "report"
 
     def review(task: ReviewTask) -> State:
+        # Progress events for live UIs (stream_mode="custom"); a no-op when nobody is streaming.
+        emit = get_stream_writer()
+        ids = {"focus": task["focus"], "path": task["path"]}
+        emit({"event": "review_start", **ids})
         try:
-            return run_reviewer(task)
+            out = run_reviewer(task, emit)
         except Exception as e:  # one failed reviewer must not sink the whole review
-            return {"errors": [f"{task['focus']} on {task['path']}: {type(e).__name__}"]}
+            err = f"{task['focus']} on {task['path']}: {type(e).__name__}"
+            emit({"event": "review_error", **ids, "error": type(e).__name__})
+            return {"errors": [err]}
+        emit({"event": "review_done", **ids, "findings": len(out["findings"])})
+        return out
 
-    def run_reviewer(task: ReviewTask) -> State:
+    def run_reviewer(task: ReviewTask, emit) -> State:
         system = (f"You are a {task['focus']} reviewer. Review ONLY for: {FOCUS_PROMPTS[task['focus']]}. "
                   f"You are reviewing changes to `{task['path']}`. Report concrete problems in the changed (+) lines. "
                   "Each diff line is prefixed with its new-file line number; use that number. "
@@ -309,6 +356,7 @@ def build_graph(llm=None, method: str = "json_schema", checkpointer=None):
                     notes.append(f"Your analysis:\n{ai.text}")
                     break
                 for call in ai.tool_calls:
+                    emit({"event": "read_file", "focus": task["focus"], "path": task["path"], "file": call["args"].get("path")})
                     result = read_file.invoke(call)  # ToolMessage
                     msgs.append(result)
                     notes.append(f"read_file({call['args'].get('path')!r}):\n{result.content}")
@@ -320,7 +368,11 @@ def build_graph(llm=None, method: str = "json_schema", checkpointer=None):
         final_msgs.append(("user", "Now list your findings."))
         result = reviewer.invoke(final_msgs)
         # The reviewer only sees this file's diff, so pin the path (models sometimes write "b/x.py" or a bare name).
-        return {"findings": [f.model_copy(update={"category": task["focus"], "file": task["path"]}) for f in result.findings]}
+        # Style is maintainability: real vulnerabilities and slowdowns belong to the other specialists, and live runs
+        # showed the style reviewer rating "no try/except" as HIGH, so cap it at medium.
+        cap = {"severity": "medium"} if task["focus"] == "style" else {}
+        return {"findings": [f.model_copy(update={"category": task["focus"], "file": task["path"],
+                                                  **(cap if f.severity == "high" else {})}) for f in result.findings]}
 
     def after_report(state: State):
         if not state.get("post") or state.get("failed"):

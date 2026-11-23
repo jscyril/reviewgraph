@@ -91,12 +91,29 @@ def test_total_failure_is_reported_as_failed_and_not_posted(monkeypatch, fake_gi
     assert not fake_github  # nothing posted
 
 
+def test_missing_structured_output_is_retried_then_falls_back(monkeypatch):
+    monkeypatch.setattr(g, "RETRY", {"stop_after_attempt": 2, "wait_exponential_jitter": False})
+    llm = StubLLM(None, {("security", "a.py"): [finding("high", line=1)]})  # planner "answers in prose": returns None
+    out = build_graph(llm).invoke({"diff": new_file_diff("a.py", 2)})
+    assert out["errors"] == ["supervisor: NoStructuredOutput"]
+    assert ("security", "a.py") in llm.review_calls and len(out["final"]) == 1
+
+
 def test_supervisor_failure_falls_back_to_all_reviewers(monkeypatch):
     monkeypatch.setattr(g, "RETRY", {"stop_after_attempt": 1})
     llm = StubLLM(Plan(reviewers=[], reason="unused"), fail_on={"plan"})
     out = build_graph(llm).invoke({"diff": new_file_diff("a.py", 2)})
     assert sorted(f for f, _ in llm.review_calls) == ["performance", "security", "style"]
     assert out["errors"] == ["supervisor: ConnectionError"]
+
+
+def test_min_severity_hides_lower_findings():
+    llm = StubLLM(Plan(reviewers=["security"], reason="code"),
+                  {("security", "a.py"): [finding("high", line=1), finding("medium", line=4), finding("low", line=7)]})
+    out = build_graph(llm).invoke({"diff": new_file_diff("a.py", 8), "min_severity": "medium"})
+    assert [f.severity for f in out["final"]] == ["high", "medium"]
+    assert "1 finding(s) below medium severity hidden" in out["report"]
+    assert len(build_graph(llm).invoke({"diff": new_file_diff("a.py", 8)})["final"]) == 3  # default shows all
 
 
 def test_no_reviewers_goes_straight_to_report():
@@ -112,11 +129,36 @@ def test_reviewer_tool_results_reach_final_prompt(tmp_path):
     assert "SENTINEL" in llm.final_prompts[0] and "looked fine" in llm.final_prompts[0]
 
 
+def test_streams_progress_events_for_live_uis(tmp_path):
+    (tmp_path / "helper.py").write_text("x = 1")
+    llm = StubLLM(Plan(reviewers=["security"], reason="code"), {("security", "a.py"): [finding("high")]}, tool_path="helper.py")
+    events = [chunk for mode, chunk in build_graph(llm).stream(
+        {"diff": new_file_diff("a.py", 2), "local_dir": str(tmp_path)}, stream_mode=["updates", "custom"]) if mode == "custom"]
+    assert [e["event"] for e in events] == ["review_start", "read_file", "review_done"]
+    assert events[1]["file"] == "helper.py" and events[2]["findings"] == 1
+
+
 def test_read_source_blocks_path_traversal(tmp_path):
     (tmp_path / "repo").mkdir()
     (tmp_path / "secret.txt").write_text("nope")
     assert "outside the repository" in read_source({"kind": "local", "root": str(tmp_path / "repo")}, "../secret.txt")
     assert "Error reading" in read_source({"kind": "local", "root": str(tmp_path / "repo")}, "missing.py")
+
+
+def test_dedupe_merges_adjacent_lines_but_not_distant_ones():
+    a = finding("medium", line=13, issue="path traversal").model_copy(update={"category": "security"})
+    b = finding("high", line=14, issue="unsanitized filename").model_copy(update={"category": "style"})
+    c = finding("low", line=16, issue="unrelated").model_copy(update={"category": "style"})
+    out = dedupe([c, b, a])
+    assert [(f.line, f.severity) for f in out] == [(14, "high"), (16, "low")]  # merged pair takes the worst finding's line
+    assert "path traversal" in out[0].issue and "unsanitized filename" in out[0].issue
+
+
+def test_style_findings_are_capped_at_medium():
+    llm = StubLLM(Plan(reviewers=["style", "security"], reason="code"),
+                  {("style", "a.py"): [finding("high", line=1)], ("security", "a.py"): [finding("high", line=9)]})
+    out = build_graph(llm).invoke({"diff": new_file_diff("a.py", 10)})
+    assert sorted((f.category, f.severity) for f in out["final"]) == [("security", "high"), ("style", "medium")]
 
 
 def test_dedupe_merges_same_line_keeps_worst_severity():
@@ -126,8 +168,8 @@ def test_dedupe_merges_same_line_keeps_worst_severity():
     d = finding("medium", line=None).model_copy(update={"category": "performance"})
     out = dedupe([a, b, c, d])
     assert len(out) == 3  # line-less findings are never merged
-    assert (out[0].severity, out[0].category) == ("high", "style, security")
-    assert "bad name" in out[0].issue and "sql injection" in out[0].issue
+    assert (out[0].severity, out[0].category) == ("high", "security, style")  # worst first
+    assert out[0].issue.splitlines() == ["- **security:** sql injection", "- **style:** bad name"]
 
 
 @pytest.fixture
@@ -147,7 +189,7 @@ def fake_github(monkeypatch):
 
 def pr_llm():
     return StubLLM(Plan(reviewers=["security"], reason="code"), {("security", "app.py"): [
-        finding("high", line=3, issue="injection"), finding("low", line=99, issue="outside diff"), finding("medium", line=4, issue="drop me")]},
+        finding("high", line=3, issue="injection"), finding("low", line=99, issue="outside diff"), finding("medium", line=6, issue="drop me")]},
         tool_path="lib.py")
 
 
@@ -156,7 +198,7 @@ def test_auto_approve_posts_inline_and_body(fake_github):
     out = build_graph(llm).invoke({"pr_url": "https://github.com/o/r/pull/7", "post": True, "auto_approve": True})
     assert out["review_url"].endswith("#review")
     assert fake_github["sha"] == "abc123"
-    assert [c["line"] for c in fake_github["comments"]] == [3, 4]  # line 99 isn't in the diff
+    assert [c["line"] for c in fake_github["comments"]] == [3, 6]  # line 99 isn't in the diff
     assert "outside diff" in fake_github["body"]
     assert "contents of lib.py@abc123" in llm.final_prompts[0]  # read_file went through the GitHub API at head sha
 
