@@ -76,7 +76,7 @@ uv run pr-reviewer changes.diff --provider groq                           # loca
 
 | `--provider` | API key env var | Default model | Structured output |
 |---|---|---|---|
-| `gemini` | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | `gemini-pro-latest` | native JSON schema |
+| `gemini` | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | `gemini-flash-latest` (free tier) | native JSON schema |
 | `groq` | `GROQ_API_KEY` | `openai/gpt-oss-120b` | tool calling |
 | `openrouter` | `OPENROUTER_API_KEY` | `openai/gpt-oss-120b` | tool calling |
 | `anthropic` | `ANTHROPIC_API_KEY` | `claude-opus-5-5` | native JSON schema |

@@ -29,7 +29,11 @@ FOCUS_PROMPTS: dict[str, str] = {
     "performance": "N+1 queries, needless allocations or copies, blocking I/O in hot or async paths, quadratic loops, missing caching or batching",
     "style": "naming, dead code, duplication, unclear control flow, swallowed or missing error handling, missing tests for new logic",
 }
+SEVERITY_GUIDE = ("Severity: high = exploitable vulnerability, data loss, or a crash/outage in normal use; "
+                  "medium = a likely bug or a significant, measurable slowdown; low = maintainability or readability. "
+                  "Missing tests, docs, or type hints are never above low.")
 MAX_TOOL_STEPS = 4  # read_file rounds per reviewer before it must answer
+RETRY = {"stop_after_attempt": 4, "wait_exponential_jitter": True}  # rides out 429s and 5xx "high demand" blips
 MAX_FILE_CHARS = 60_000
 FULL_DIFF_FOR_SUPERVISOR = 100_000  # above this the supervisor sees only the file list
 LOCKFILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "uv.lock", "poetry.lock", "Pipfile.lock",
@@ -70,7 +74,9 @@ class State(TypedDict, total=False):
     plan: Plan
     findings: Annotated[list[Finding], operator.add]  # reducer: parallel reviewers append
     final: list[Finding]  # deduped + ranked; what gets posted
+    errors: Annotated[list[str], operator.add]  # reviewers that failed after retries; the rest still report
     report: str
+    failed: bool  # every reviewer errored: don't post, exit non-zero
     approved: bool
     review_url: str
 
@@ -151,6 +157,14 @@ def render_report(state: State) -> State:
     lines = ["# PR Review", ""]
     if plan:
         lines += [f"**Reviewers run:** {', '.join(plan.reviewers) or 'none'} on {len(state.get('files', {}))} file(s) — {plan.reason}", ""]
+    errors = state.get("errors", [])
+    planned = len(state.get("files", {})) * len(plan.reviewers) if plan else 0
+    failed = planned > 0 and sum(not e.startswith("supervisor:") for e in errors) >= planned
+    if failed:  # never let a total outage read as a clean bill of health
+        lines += [f"**Review failed:** every reviewer errored ({'; '.join(errors)}). Nothing was reviewed."]
+        return {"final": [], "report": "\n".join(lines), "failed": True}
+    if errors:
+        lines += [f"**Warning: incomplete review.** Failed: {'; '.join(errors)}", ""]
     if not final:
         lines.append("No issues found.")
     for i, f in enumerate(final, 1):
@@ -179,6 +193,8 @@ def post(state: State) -> State:
     body = [f"## Multi-agent review\n\n{len(state['final'])} finding(s), {len(inline)} inline."]
     if plan:
         body.append(f"Reviewers: {', '.join(plan.reviewers) or 'none'} — {plan.reason}")
+    if errors := state.get("errors"):
+        body.append(f"**Warning: incomplete review.** Failed: {'; '.join(errors)}")
     if not state["final"]:
         body.append("No issues found.")
     if general:
@@ -195,7 +211,7 @@ def post(state: State) -> State:
 # anthropic: "function_calling" forces tool_choice, which Opus 5.5 rejects, so it uses native json_schema.
 # groq/openrouter: json_schema support varies by hosted model; tool calling works across nearly all of them.
 PROVIDERS = {
-    "gemini": ("gemini-pro-latest", "json_schema"),  # GEMINI_API_KEY or GOOGLE_API_KEY
+    "gemini": ("gemini-flash-latest", "json_schema"),  # GEMINI_API_KEY or GOOGLE_API_KEY; pro models have no free tier
     "groq": ("openai/gpt-oss-120b", "function_calling"),  # GROQ_API_KEY
     "openrouter": ("openai/gpt-oss-120b", "function_calling"),  # OPENROUTER_API_KEY
     "anthropic": ("claude-opus-5-5", "json_schema"),  # ANTHROPIC_API_KEY
@@ -210,7 +226,8 @@ def make_llm(provider: str, model: str | None = None):
     # Imports are lazy so a missing or broken provider package only matters when that provider is chosen.
     if provider == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
-        llm = ChatGoogleGenerativeAI(model=model)
+        # max_retries=1 disables the Google SDK's own 6 retries (0 means "SDK default"), so they don't multiply ours.
+        llm = ChatGoogleGenerativeAI(model=model, max_retries=1)
     elif provider == "groq":
         from langchain_groq import ChatGroq
         llm = ChatGroq(model=model)
@@ -231,8 +248,8 @@ def build_graph(llm=None, method: str = "json_schema", checkpointer=None):
     """checkpointer is required for the human approval step (state must survive the interrupt)."""
     if llm is None:
         llm, method = make_llm("gemini")
-    planner = llm.with_structured_output(Plan, method=method)
-    reviewer = llm.with_structured_output(Review, method=method)
+    planner = llm.with_structured_output(Plan, method=method).with_retry(**RETRY)
+    reviewer = llm.with_structured_output(Review, method=method).with_retry(**RETRY)
 
     def supervisor(state: State) -> State:
         files = state["files"]
@@ -241,13 +258,17 @@ def build_graph(llm=None, method: str = "json_schema", checkpointer=None):
         body = f"Changed files:\n{summary}"
         if len(diff) <= FULL_DIFF_FOR_SUPERVISOR:
             body += f"\n\nDiff:\n{diff}"
-        plan = planner.invoke([
-            ("system", "You are a lead code reviewer. Pick which specialist reviewers "
-                       "(security, performance, style) are worth running on this pull request. "
-                       "Skip a specialist only if the change clearly has nothing in its area "
-                       "(e.g. docs-only changes need no security or performance review)."),
-            ("user", body),
-        ])
+        try:
+            plan = planner.invoke([
+                ("system", "You are a lead code reviewer. Pick which specialist reviewers "
+                           "(security, performance, style) are worth running on this pull request. "
+                           "Skip a specialist only if the change clearly has nothing in its area "
+                           "(e.g. docs-only changes need no security or performance review)."),
+                ("user", body),
+            ])
+        except Exception as e:  # planning is an optimization; without it, run every specialist
+            return {"plan": Plan(reviewers=["security", "performance", "style"], reason="supervisor failed; ran all reviewers"),
+                    "errors": [f"supervisor: {type(e).__name__}"]}
         return {"plan": plan}
 
     def route(state: State):
@@ -259,9 +280,16 @@ def build_graph(llm=None, method: str = "json_schema", checkpointer=None):
         return tasks or "report"
 
     def review(task: ReviewTask) -> State:
+        try:
+            return run_reviewer(task)
+        except Exception as e:  # one failed reviewer must not sink the whole review
+            return {"errors": [f"{task['focus']} on {task['path']}: {type(e).__name__}"]}
+
+    def run_reviewer(task: ReviewTask) -> State:
         system = (f"You are a {task['focus']} reviewer. Review ONLY for: {FOCUS_PROMPTS[task['focus']]}. "
                   f"You are reviewing changes to `{task['path']}`. Report concrete problems in the changed (+) lines. "
                   "Each diff line is prefixed with its new-file line number; use that number. "
+                  f"{SEVERITY_GUIDE} Only report issues you are confident are real. "
                   "No praise, no speculation, no issues outside your specialty.")
         diff_msg = ("user", f"Diff for `{task['path']}`:\n{task['file_diff']['numbered']}")
         notes = []
@@ -273,7 +301,7 @@ def build_graph(llm=None, method: str = "json_schema", checkpointer=None):
 
             msgs = [("system", system + " Use read_file when you need surrounding code, callers, or definitions "
                                         "to judge a change. When you have enough context, reply with your analysis."), diff_msg]
-            agent = llm.bind_tools([read_file])
+            agent = llm.bind_tools([read_file]).with_retry(**RETRY)
             for _ in range(MAX_TOOL_STEPS):
                 ai = agent.invoke(msgs)
                 msgs.append(ai)
@@ -295,7 +323,7 @@ def build_graph(llm=None, method: str = "json_schema", checkpointer=None):
         return {"findings": [f.model_copy(update={"category": task["focus"], "file": task["path"]}) for f in result.findings]}
 
     def after_report(state: State):
-        if not state.get("post"):
+        if not state.get("post") or state.get("failed"):
             return END
         return "post" if state.get("auto_approve") else "approve"
 

@@ -37,6 +37,7 @@ def summarize(rows: list[dict]) -> dict:
         "right_reviewer": sum(r["category_match"] for r in bugs),
         "clean_false_positives": sum(r["false_positives"] for r in clean),
         "clean_files": len(clean),
+        "cases_with_errors": sum(bool(r.get("errors")) for r in rows),  # nonzero = scores understate the model
     }
 
 
@@ -47,9 +48,10 @@ def run(provider: str, model: str | None) -> dict:
     for case in CASES:
         out = graph.invoke({"diff": as_diff(case)}, {"max_concurrency": 4, "run_name": f"eval:{case['id']}", "tags": ["eval", provider]})
         findings = [f.model_dump() for f in out["final"]]
-        rows.append({**score(case, findings), "findings": findings})
-        print(f"  {case['id']:<26} {'clean' if rows[-1]['clean'] else ('CAUGHT' if rows[-1]['caught'] else 'missed')}"
-              f"  ({len(findings)} finding(s))")
+        errors = out.get("errors", [])
+        rows.append({**score(case, findings), "findings": findings, "errors": errors})
+        status = "clean" if rows[-1]["clean"] else ("CAUGHT" if rows[-1]["caught"] else "missed")
+        print(f"  {case['id']:<26} {status}  ({len(findings)} finding(s))" + (f"  ERRORS: {'; '.join(errors)}" if errors else ""))
     result = {"provider": provider, "model": model or PROVIDERS[provider][0], "seconds": round(time.time() - start, 1),
               **summarize(rows), "cases": rows}
     RESULTS.mkdir(exist_ok=True)
@@ -67,11 +69,11 @@ def main() -> None:
     for provider in args.provider:
         print(f"== {provider}")
         results.append(run(provider, args.model))
-    print("\n| Provider | Model | Recall | Right reviewer | False positives on clean files | Time |")
-    print("|---|---|---|---|---|---|")
+    print("\n| Provider | Model | Recall | Right reviewer | False positives on clean files | Cases with errors | Time |")
+    print("|---|---|---|---|---|---|---|")
     for r in results:
         print(f"| {r['provider']} | {r['model']} | {r['caught']}/{r['bugs']} ({r['recall']:.0%}) | {r['right_reviewer']}/{r['bugs']} "
-              f"| {r['clean_false_positives']} across {r['clean_files']} files | {r['seconds']}s |")
+              f"| {r['clean_false_positives']} across {r['clean_files']} files | {r['cases_with_errors']} | {r['seconds']}s |")
 
 
 if __name__ == "__main__":

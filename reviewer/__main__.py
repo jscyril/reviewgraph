@@ -54,6 +54,8 @@ def main() -> None:
             print("Not posted.")
     if out.get("review_url"):
         print(f"\nPosted: {out['review_url']}")
+    if out.get("failed"):
+        sys.exit(1)  # fail the CI job instead of passing silently
 
 
 if __name__ == "__main__":

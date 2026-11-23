@@ -1,5 +1,6 @@
 import pytest
 from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
@@ -16,37 +17,39 @@ def new_file_diff(path: str, n: int) -> str:
 class StubLLM:
     """Stands in for any chat model: canned plan, canned findings per (focus, file), optional scripted tool use."""
 
-    def __init__(self, plan: Plan, findings=None, tool_path: str | None = None):
-        self.plan, self.findings, self.tool_path = plan, findings or {}, tool_path
+    def __init__(self, plan: Plan, findings=None, tool_path: str | None = None, fail_on=()):
+        self.plan, self.findings, self.tool_path, self.fail_on = plan, findings or {}, tool_path, set(fail_on)
         self.review_calls, self.final_prompts = [], []
 
     def with_structured_output(self, schema, method=None):
         stub = self
 
-        class Runner:
-            def invoke(self, messages):
-                if schema is Plan:
-                    return stub.plan
-                system = messages[0][1]
-                focus = next(f for f in ("security", "performance", "style") if f"a {f} reviewer" in system)
-                path = system.split("`")[1]
-                stub.review_calls.append((focus, path))
-                stub.final_prompts.append("\n".join(m[1] for m in messages))
-                return Review(findings=stub.findings.get((focus, path), []))
+        def invoke(messages):
+            if schema is Plan:
+                if "plan" in stub.fail_on:
+                    raise ConnectionError("503 high demand")
+                return stub.plan
+            system = messages[0][1]
+            focus = next(f for f in ("security", "performance", "style") if f"a {f} reviewer" in system)
+            path = system.split("`")[1]
+            stub.review_calls.append((focus, path))
+            if focus in stub.fail_on:
+                raise ConnectionError("503 high demand")
+            stub.final_prompts.append("\n".join(m[1] for m in messages))
+            return Review(findings=stub.findings.get((focus, path), []))
 
-        return Runner()
+        return RunnableLambda(invoke)
 
     def bind_tools(self, tools):
         stub = self
 
-        class Agent:
-            def invoke(self, messages):
-                already_called = any(getattr(m, "type", None) == "tool" for m in messages)
-                if stub.tool_path and not already_called:
-                    return AIMessage(content="", tool_calls=[{"name": "read_file", "args": {"path": stub.tool_path}, "id": "c1"}])
-                return AIMessage(content="looked fine except noted issues")
+        def invoke(messages):
+            already_called = any(getattr(m, "type", None) == "tool" for m in messages)
+            if stub.tool_path and not already_called:
+                return AIMessage(content="", tool_calls=[{"name": "read_file", "args": {"path": stub.tool_path}, "id": "c1"}])
+            return AIMessage(content="looked fine except noted issues")
 
-        return Agent()
+        return RunnableLambda(invoke)
 
 
 def finding(sev, file="app.py", line=1, issue=None):
@@ -68,6 +71,32 @@ def test_lockfiles_are_not_reviewed():
     llm = StubLLM(Plan(reviewers=["security"], reason="deps"))
     build_graph(llm).invoke({"diff": new_file_diff("web/package-lock.json", 5) + new_file_diff("web/index.js", 2)})
     assert llm.review_calls == [("security", "web/index.js")]
+
+
+def test_failed_reviewer_is_retried_then_reported_without_sinking_the_rest(monkeypatch):
+    monkeypatch.setattr(g, "RETRY", {"stop_after_attempt": 3, "wait_exponential_jitter": False})
+    llm = StubLLM(Plan(reviewers=["security", "style"], reason="code"),
+                  {("style", "a.py"): [finding("low", line=1)]}, fail_on={"security"})
+    out = build_graph(llm).invoke({"diff": new_file_diff("a.py", 2)})
+    assert llm.review_calls.count(("security", "a.py")) == 3  # retried
+    assert out["errors"] == ["security on a.py: ConnectionError"]
+    assert len(out["final"]) == 1 and "incomplete review" in out["report"]
+
+
+def test_total_failure_is_reported_as_failed_and_not_posted(monkeypatch, fake_github):
+    monkeypatch.setattr(g, "RETRY", {"stop_after_attempt": 1})
+    llm = StubLLM(Plan(reviewers=["security"], reason="code"), fail_on={"security"})
+    out = build_graph(llm).invoke({"pr_url": "https://github.com/o/r/pull/7", "post": True, "auto_approve": True})
+    assert out["failed"] and "Review failed" in out["report"] and "No issues found" not in out["report"]
+    assert not fake_github  # nothing posted
+
+
+def test_supervisor_failure_falls_back_to_all_reviewers(monkeypatch):
+    monkeypatch.setattr(g, "RETRY", {"stop_after_attempt": 1})
+    llm = StubLLM(Plan(reviewers=[], reason="unused"), fail_on={"plan"})
+    out = build_graph(llm).invoke({"diff": new_file_diff("a.py", 2)})
+    assert sorted(f for f, _ in llm.review_calls) == ["performance", "security", "style"]
+    assert out["errors"] == ["supervisor: ConnectionError"]
 
 
 def test_no_reviewers_goes_straight_to_report():
