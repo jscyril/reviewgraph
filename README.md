@@ -10,21 +10,21 @@ It runs as a **GitHub Action** on every PR, as a **web app**, or as a **CLI**. I
 
 ```mermaid
 graph LR
-  START --> fetch[fetch PR<br/>diff + head SHA] --> supervisor
-  supervisor -- "Send × (file, specialist)" --> review
-  subgraph review [reviewer agent, one per file × specialist]
+  start([START]) --> fetch["fetch PR<br/>diff + head SHA"] --> supervisor
+  supervisor -->|"Send × (file, specialist)"| review
+  subgraph review ["reviewer agent, one per file × specialist"]
     direction TB
-    think[LLM] -- read_file --> gh[(GitHub API<br/>at head SHA)] --> think
+    think[LLM] -->|read_file| gh[("GitHub API<br/>at head SHA")] --> think
     think --> out[structured findings]
   end
-  supervisor -. nothing to review .-> report
-  review --> report[dedupe + rank]
-  report -- --post --> approve{{human approval<br/>interrupt}}
-  report -- --post --yes --> post
-  approve -- approved --> post[post GitHub review<br/>inline comments]
-  approve -- rejected --> END
-  report --> END
-  post --> END
+  supervisor -.->|nothing to review| report
+  review --> report["dedupe + rank"]
+  report -->|"--post"| approve{{"human approval<br/>interrupt"}}
+  report -->|"--post --yes"| post
+  approve -->|approved| post["post GitHub review<br/>inline comments"]
+  approve -->|rejected| done([END])
+  report -->|"no --post"| done
+  post --> done
 ```
 
 ## What it shows
