@@ -1,0 +1,35 @@
+[project]
+name = "pr-reviewer"
+version = "0.1.0"
+description = "Multi-agent GitHub PR reviewer built with LangGraph"
+authors = [
+    { name = "jscyril", email = "jacobsebcyril@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "langchain-anthropic>=1.7.12",
+    "langchain-google-genai>=4.5.2",
+    "langchain-groq>=1.2.1",
+    "langchain-openai>=1.8.5",
+    "langgraph>=1.2.24",
+]
+
+[project.scripts]
+pr-reviewer = "reviewer.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "reviewer"
+module-root = ""
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

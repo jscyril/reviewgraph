@@ -1,0 +1,30 @@
+# Reviews PRs to this repo with the action defined in ../../action.yml.
+# Add a GEMINI_API_KEY repository secret (Settings -> Secrets and variables -> Actions).
+name: PR Review
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr-url:
+        description: PR URL to review
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    # Fork PRs get no secrets and a read-only token, so the review can't run or post there.
+    if: github.event_name == 'workflow_dispatch' || (!github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./
+        with:
+          provider: gemini
+          pr-url: ${{ github.event.inputs.pr-url || github.event.pull_request.html_url }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

@@ -1,0 +1,40 @@
+name: ReviewGraph PR Reviewer
+description: LangGraph supervisor + parallel security/performance/style reviewers that post inline review comments.
+branding:
+  icon: eye
+  color: purple
+
+inputs:
+  provider:
+    description: "LLM provider: gemini, groq, openrouter, or anthropic. Set its API key as an env var on this step."
+    default: gemini
+  model:
+    description: Override the provider's default model.
+    default: ""
+  pr-url:
+    description: PR to review. Defaults to the PR that triggered the workflow.
+    default: ${{ github.event.pull_request.html_url }}
+  github-token:
+    description: Token used to read the PR and post the review (needs pull-requests write).
+    default: ${{ github.token }}
+  max-concurrency:
+    description: Max reviewers running at once (lower it if you hit provider rate limits).
+    default: "8"
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v7
+    - shell: bash
+      # Inputs go through env, never inlined into the script, so PR-controlled text can't inject shell.
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        PR_URL: ${{ inputs.pr-url }}
+        PROVIDER: ${{ inputs.provider }}
+        MODEL: ${{ inputs.model }}
+        MAX_CONCURRENCY: ${{ inputs.max-concurrency }}
+      run: |
+        if [ -z "$PR_URL" ]; then echo "::error::No PR to review: run on pull_request or set pr-url"; exit 1; fi
+        uv run --quiet --frozen --project "$GITHUB_ACTION_PATH" pr-reviewer "$PR_URL" \
+          --provider "$PROVIDER" ${MODEL:+--model "$MODEL"} \
+          --max-concurrency "$MAX_CONCURRENCY" --post --yes | tee -a "$GITHUB_STEP_SUMMARY"
